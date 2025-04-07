@@ -1,0 +1,7 @@
+streamlit
+face_recognition
+gTTS
+requests
+pillow
+numpy
+dlib
