@@ -1,99 +1,152 @@
 import streamlit as st
+import mysql.connector
 import requests
 import face_recognition
-from PIL import Image
-from gtts import gTTS
 import os
+import pyttsx3
+import threading
+import cv2
+import numpy as np
+from PIL import Image
 import io
 
-KNOWN_FOLDER = "known_faces"
-ESP32_SERVER_URL = "https://esp32-upload-server.onrender.com"
-FLASK_UPLOAD_URL = "https://flask-upload-pzch.onrender.com/upload"
-MAX_FILE_SIZE_MB = 3
-MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+# Public Render Flask Server where ESP32 uploads the image
+ESP32CAM_URL = "https://esp32-upload-server.onrender.com/latest"
+SAVE_PATH = "captured_image.jpg"
 
-# Sidebar Navigation
-st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Face Recognition", "Upload Known Face"])
+# MySQL Clever Cloud DB connection
+def connect_db():
+    return mysql.connector.connect(
+        host="b1fvdoqarhekhvzuhdcj-mysql.services.clever-cloud.com",
+        user="uulwfabkmrk4gxk2",
+        password="YOUR_PASSWORD",  # 🔐 Replace with your real password
+        database="b1fvdoqarhekhvzuhdcj",
+        port=3306
+    )
 
-# Load known encodings
-def load_known_encodings():
-    encodings = []
-    names = []
-    for file in os.listdir(KNOWN_FOLDER):
-        path = os.path.join(KNOWN_FOLDER, file)
-        img = face_recognition.load_image_file(path)
-        face_enc = face_recognition.face_encodings(img)
-        if face_enc:
-            encodings.append(face_enc[0])
-            names.append(file.split('.')[0])
-    return encodings, names
+# Announce messages with TTS in a thread
+def announce(message):
+    def speak():
+        engine = pyttsx3.init()
+        engine.say(message)
+        engine.runAndWait()
+    threading.Thread(target=speak).start()
 
-# Get latest image from ESP32 server
-def get_latest_image():
-    r = requests.get(f"{ESP32_SERVER_URL}/latest")
-    if r.status_code != 200:
-        return None
-    filename = r.json()["filename"]
-    return f"{ESP32_SERVER_URL}/uploads/{filename}"
+# Encode face using face_recognition
+def encode_faces(image):
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    face_locations = face_recognition.face_locations(rgb_image)
+    face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
+    return face_encodings, face_locations
 
-# -------------------- PAGE 1: Face Recognition --------------------
-if page == "Face Recognition":
-    st.title("ESP32-CAM Face Recognition (face_recognition + dlib)")
+# Compare captured encodings with DB encodings
+def recognize_faces(captured_encodings):
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT image_name, image_data FROM images")
+    data = cursor.fetchall()
+    cursor.close()
+    conn.close()
 
-    if st.button("Check for New Image"):
-        image_url = get_latest_image()
-        if image_url:
-            st.image(image_url, caption="Captured Image", use_container_width=True)
-            img_data = requests.get(image_url).content
-            with open("latest.jpg", "wb") as f:
-                f.write(img_data)
+    face_results = []
 
-            unknown_image = face_recognition.load_image_file("latest.jpg")
-            unknown_encodings = face_recognition.face_encodings(unknown_image)
+    for captured_encoding in captured_encodings:
+        best_match = "Unknown"
+        min_distance = 0.6
 
-            if unknown_encodings:
-                known_encodings, known_names = load_known_encodings()
-                results = face_recognition.compare_faces(known_encodings, unknown_encodings[0])
-                if True in results:
-                    index = results.index(True)
-                    match = known_names[index]
-                    st.success(f"✅ Match found: {match}")
-                    tts = gTTS(f"Match found: {match}")
-                else:
-                    st.error("❌ No match found")
-                    tts = gTTS("No match found")
-            else:
-                st.warning("😕 No face detected in the captured image.")
-                tts = gTTS("No face detected")
+        for image_name, image_blob in data:
+            stored_image = np.array(Image.open(io.BytesIO(image_blob)))
+            stored_encodings, _ = encode_faces(stored_image)
 
-            tts.save("result.mp3")
-            st.audio("result.mp3", autoplay=True)
-        else:
-            st.warning("No image found on server.")
+            for stored_encoding in stored_encodings:
+                distance = face_recognition.face_distance([stored_encoding], captured_encoding)[0]
+                if distance < min_distance:
+                    min_distance = distance
+                    best_match = image_name
+        
+        face_results.append(best_match if best_match != "Unknown" else "Unknown Face")
 
-# -------------------- PAGE 2: Upload Known Face --------------------
-elif page == "Upload Known Face":
-    st.title("Upload New Known Face")
+    return face_results
 
-    uploaded_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
-    if uploaded_file is not None:
-        st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+# Draw boxes and labels on image
+def draw_bounding_boxes(image, face_locations, match_results):
+    for (top, right, bottom, left), name in zip(face_locations, match_results):
+        cv2.rectangle(image, (left, top), (right, bottom), (0, 255, 0), 2)
+        cv2.putText(image, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    return image
 
-        if st.button("Upload to GitHub"):
-            file_data = uploaded_file.getvalue()
-            if len(file_data) > MAX_FILE_SIZE_BYTES:
-                st.error(f"❌ File too large. Please upload a file under {MAX_FILE_SIZE_MB} MB.")
-            else:
-                try:
-                    safe_filename = uploaded_file.name.replace(" ", "_")
-                    files = {"file": (safe_filename, file_data)}
-                    response = requests.post(FLASK_UPLOAD_URL, files=files, timeout=30)
-                    if response.status_code == 201:
-                        st.success("✅ Image uploaded to GitHub successfully.")
+# Upload image to DB
+def upload_image_to_db(image, image_name):
+    conn = connect_db()
+    cursor = conn.cursor()
+    image_bytes = io.BytesIO()
+    image.save(image_bytes, format='JPEG')
+    image_data = image_bytes.getvalue()
+    
+    cursor.execute("INSERT INTO images (image_name, image_data) VALUES (%s, %s)", (image_name, image_data))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+# --- Streamlit App UI ---
+st.title("Second Eye - Image Recognition System 👁️")
+
+page = st.sidebar.selectbox("Select Page", ["Home", "Supervisor", "User"])
+
+if page == "Home":
+    st.subheader("Live Recognition from ESP32-CAM")
+
+    try:
+        response = requests.get(ESP32CAM_URL)
+        if response.status_code == 200:
+            with open(SAVE_PATH, "wb") as f:
+                f.write(response.content)
+
+            captured_image = cv2.imread(SAVE_PATH)
+            captured_encodings, face_locations = encode_faces(captured_image)
+
+            if captured_encodings:
+                match_results = recognize_faces(captured_encodings)
+                processed_image = draw_bounding_boxes(captured_image, face_locations, match_results)
+                processed_pil = Image.fromarray(cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB))
+                st.image(processed_pil, caption="Processed Image", use_column_width=True)
+
+                for idx, name in enumerate(match_results, 1):
+                    if name == "Unknown Face":
+                        announce(f"Face {idx}: Not recognized")
+                        st.warning(f"Face {idx}: Not recognized")
                     else:
-                        st.error(f"❌ Upload failed. Status code: {response.status_code}\n{response.text}")
-                except requests.exceptions.ChunkedEncodingError:
-                    st.error("⚠️ Upload failed due to network or encoding error. Try again or use a smaller image.")
-                except requests.exceptions.RequestException as e:
-                    st.error(f"⚠️ Upload failed: {str(e)}")
+                        announce(f"Face {idx}: Match found with {name}")
+                        st.success(f"Face {idx}: Match found with {name}")
+            else:
+                st.warning("No face detected.")
+                announce("No face detected.")
+        else:
+            st.error("ESP32-CAM image fetch failed.")
+            announce("Failed to capture image.")
+    except Exception as e:
+        st.error(f"Error: {e}")
+        announce("Something went wrong.")
+
+elif page == "Supervisor":
+    st.subheader("Upload Known Face")
+    uploaded = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+    name = st.text_input("Enter Name")
+
+    if st.button("Upload") and uploaded and name:
+        image = Image.open(uploaded)
+        upload_image_to_db(image, name)
+        st.success("Image uploaded successfully!")
+
+elif page == "User":
+    st.subheader("Stored Known Faces")
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT image_name, image_data FROM images")
+    images = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    for image_name, blob in images:
+        image = Image.open(io.BytesIO(blob))
+        st.image(image, caption=image_name, use_column_width=True)
