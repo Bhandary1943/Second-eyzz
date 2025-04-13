@@ -1,7 +1,7 @@
 streamlit
+opencv-python
 face_recognition
-gTTS
-requests
-pillow
 numpy
-dlib
+mysql-connector-python
+pyttsx3
+Pillow
