@@ -19,7 +19,7 @@ def connect_db():
     return mysql.connector.connect(
         host="b1fvdoqarhekhvzuhdcj-mysql.services.clever-cloud.com",
         user="uulwfabkmrk4gxk2",
-        password="YOUR_PASSWORD",  # 🔐 Replace with your real password
+        password="Indira@1943",  # 🔐 Replace with your real password
         database="b1fvdoqarhekhvzuhdcj",
         port=3306
     )
