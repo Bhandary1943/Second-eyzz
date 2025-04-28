@@ -1,7 +1,8 @@
 streamlit
-opencv-python
-face_recognition
+requests
+opencv-contrib-python-headless
 numpy
-mysql-connector-python
-pyttsx3
-Pillow
+pillow
+gTTS
+deepface
+tensorflow==2.12.0
